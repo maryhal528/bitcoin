@@ -3,13 +3,18 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
-
 #include <key.h>
+#include <pubkey.h>
 #include <random.h>
+#include <span.h>
+#include <uint256.h>
+
+#include <algorithm>
+#include <cassert>
 
 static void EllSwiftCreate(benchmark::Bench& bench)
 {
-    ECC_Start();
+    ECC_Context ecc_context{};
 
     CKey key = GenerateRandomKey();
     uint256 entropy = GetRandHash();
@@ -22,8 +27,6 @@ static void EllSwiftCreate(benchmark::Bench& bench)
         /* Use the last 32 bytes of the ellswift encoded public key as next entropy. */
         std::copy(ret.begin() + 32, ret.begin() + 64, MakeWritableByteSpan(entropy).begin());
     });
-
-    ECC_Stop();
 }
 
 BENCHMARK(EllSwiftCreate, benchmark::PriorityLevel::HIGH);

@@ -5,7 +5,7 @@
 """Helpful routines for regression testing."""
 
 from base64 import b64encode
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from subprocess import CalledProcessError
 import hashlib
 import inspect
@@ -14,13 +14,16 @@ import logging
 import os
 import pathlib
 import platform
+import random
 import re
 import time
 
 from . import coverage
 from .authproxy import AuthServiceProxy, JSONRPCException
 from collections.abc import Callable
-from typing import Optional
+from typing import Optional, Union
+
+SATOSHI_PRECISION = Decimal('0.00000001')
 
 logger = logging.getLogger("TestFramework.utils")
 
@@ -247,6 +250,12 @@ def ceildiv(a, b):
     return -(-a // b)
 
 
+def random_bitflip(data):
+    data = list(data)
+    data[random.randrange(len(data))] ^= (1 << (random.randrange(8)))
+    return bytes(data)
+
+
 def get_fee(tx_size, feerate_btc_kvb):
     """Calculate the fee in BTC given a feerate is BTC/kvB. Reflects CFeeRate::GetFee"""
     feerate_sat_kvb = int(feerate_btc_kvb * Decimal(1e8)) # Fee in sat/kvb as an int to avoid float precision errors
@@ -254,11 +263,33 @@ def get_fee(tx_size, feerate_btc_kvb):
     return target_fee_sat / Decimal(1e8) # Return result in  BTC
 
 
-def satoshi_round(amount):
-    return Decimal(amount).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+def satoshi_round(amount: Union[int, float, str], *, rounding: str) -> Decimal:
+    """Rounds a Decimal amount to the nearest satoshi using the specified rounding mode."""
+    return Decimal(amount).quantize(SATOSHI_PRECISION, rounding=rounding)
 
 
-def wait_until_helper_internal(predicate, *, attempts=float('inf'), timeout=float('inf'), lock=None, timeout_factor=1.0):
+def ensure_for(*, duration, f, check_interval=0.2):
+    """Check if the predicate keeps returning True for duration.
+
+    check_interval can be used to configure the wait time between checks.
+    Setting check_interval to 0 will allow to have two checks: one in the
+    beginning and one after duration.
+    """
+    # If check_interval is 0 or negative or larger than duration, we fall back
+    # to checking once in the beginning and once at the end of duration
+    if check_interval <= 0 or check_interval > duration:
+        check_interval = duration
+    time_end = time.time() + duration
+    predicate_source = "''''\n" + inspect.getsource(f) + "'''"
+    while True:
+        if not f():
+            raise AssertionError(f"Predicate {predicate_source} became false within {duration} seconds")
+        if time.time() > time_end:
+            return
+        time.sleep(check_interval)
+
+
+def wait_until_helper_internal(predicate, *, timeout=60, lock=None, timeout_factor=1.0, check_interval=0.05):
     """Sleep until the predicate resolves to be True.
 
     Warning: Note that this method is not recommended to be used in tests as it is
@@ -267,13 +298,10 @@ def wait_until_helper_internal(predicate, *, attempts=float('inf'), timeout=floa
     properly scaled. Furthermore, `wait_until()` from `P2PInterface` class in
     `p2p.py` has a preset lock.
     """
-    if attempts == float('inf') and timeout == float('inf'):
-        timeout = 60
     timeout = timeout * timeout_factor
-    attempt = 0
     time_end = time.time() + timeout
 
-    while attempt < attempts and time.time() < time_end:
+    while time.time() < time_end:
         if lock:
             with lock:
                 if predicate():
@@ -281,17 +309,12 @@ def wait_until_helper_internal(predicate, *, attempts=float('inf'), timeout=floa
         else:
             if predicate():
                 return
-        attempt += 1
-        time.sleep(0.05)
+        time.sleep(check_interval)
 
     # Print the cause of the timeout
     predicate_source = "''''\n" + inspect.getsource(predicate) + "'''"
     logger.error("wait_until() failed. Predicate: {}".format(predicate_source))
-    if attempt >= attempts:
-        raise AssertionError("Predicate {} not true after {} attempts".format(predicate_source, attempts))
-    elif time.time() >= time_end:
-        raise AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
-    raise RuntimeError('Unreachable')
+    raise AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
 
 
 def sha256sum_file(filename):
@@ -304,14 +327,21 @@ def sha256sum_file(filename):
     return h.digest()
 
 
+def util_xor(data, key, *, offset):
+    data = bytearray(data)
+    for i in range(len(data)):
+        data[i] ^= key[(i + offset) % len(key)]
+    return bytes(data)
+
+
 # RPC/P2P connection constants and functions
 ############################################
 
 # The maximum number of nodes a single test can spawn
 MAX_NODES = 12
-# Don't assign rpc or p2p ports lower than this
+# Don't assign p2p, rpc or tor ports lower than this
 PORT_MIN = int(os.getenv('TEST_RUNNER_PORT_MIN', default=11000))
-# The number of ports to "reserve" for p2p and rpc, each
+# The number of ports to "reserve" for p2p, rpc and tor, each
 PORT_RANGE = 5000
 
 
@@ -351,7 +381,11 @@ def p2p_port(n):
 
 
 def rpc_port(n):
-    return PORT_MIN + PORT_RANGE + n + (MAX_NODES * PortSeed.n) % (PORT_RANGE - 1 - MAX_NODES)
+    return p2p_port(n) + PORT_RANGE
+
+
+def tor_port(n):
+    return p2p_port(n) + PORT_RANGE * 2
 
 
 def rpc_url(datadir, i, chain, rpchost):
@@ -412,7 +446,6 @@ def write_config(config_path, *, n, chain, extra_config="", disable_autoconnect=
         # in tests.
         f.write("peertimeout=999999999\n")
         f.write("printtoconsole=0\n")
-        f.write("upnp=0\n")
         f.write("natpmp=0\n")
         f.write("shrinkdebugfile=0\n")
         f.write("deprecatedrpc=create_bdb\n")  # Required to run the tests
@@ -496,65 +529,6 @@ def check_node_connections(*, node, num_in, num_out):
     assert_equal(info["connections_in"], num_in)
     assert_equal(info["connections_out"], num_out)
 
-def fill_mempool(test_framework, node, miniwallet):
-    """Fill mempool until eviction.
-
-    Allows for simpler testing of scenarios with floating mempoolminfee > minrelay
-    Requires -datacarriersize=100000 and
-   -maxmempool=5.
-    It will not ensure mempools become synced as it
-    is based on a single node and assumes -minrelaytxfee
-    is 1 sat/vbyte.
-    To avoid unintentional tx dependencies, it is recommended to use separate miniwallets for
-    mempool filling vs transactions in tests.
-    """
-    test_framework.log.info("Fill the mempool until eviction is triggered and the mempoolminfee rises")
-    txouts = gen_return_txouts()
-    relayfee = node.getnetworkinfo()['relayfee']
-
-    assert_equal(relayfee, Decimal('0.00001000'))
-
-    tx_batch_size = 1
-    num_of_batches = 75
-    # Generate UTXOs to flood the mempool
-    # 1 to create a tx initially that will be evicted from the mempool later
-    # 75 transactions each with a fee rate higher than the previous one
-    test_framework.generate(miniwallet, 1 + (num_of_batches * tx_batch_size))
-
-    # Mine COINBASE_MATURITY - 1 blocks so that the UTXOs are allowed to be spent
-    test_framework.generate(node, 100 - 1)
-
-    # Get all UTXOs up front to ensure none of the transactions spend from each other, as that may
-    # change their effective feerate and thus the order in which they are selected for eviction.
-    confirmed_utxos = [miniwallet.get_utxo(confirmed_only=True) for _ in range(num_of_batches * tx_batch_size + 1)]
-    assert_equal(len(confirmed_utxos), num_of_batches * tx_batch_size + 1)
-
-    test_framework.log.debug("Create a mempool tx that will be evicted")
-    tx_to_be_evicted_id = miniwallet.send_self_transfer(from_node=node, utxo_to_spend=confirmed_utxos[0], fee_rate=relayfee)["txid"]
-    del confirmed_utxos[0]
-
-    # Increase the tx fee rate to give the subsequent transactions a higher priority in the mempool
-    # The tx has an approx. vsize of 65k, i.e. multiplying the previous fee rate (in sats/kvB)
-    # by 130 should result in a fee that corresponds to 2x of that fee rate
-    base_fee = relayfee * 130
-
-    test_framework.log.debug("Fill up the mempool with txs with higher fee rate")
-    with node.assert_debug_log(["rolling minimum fee bumped"]):
-        for batch_of_txid in range(num_of_batches):
-            fee = (batch_of_txid + 1) * base_fee
-            utxos = confirmed_utxos[:tx_batch_size]
-            create_lots_of_big_transactions(miniwallet, node, fee, tx_batch_size, txouts, utxos)
-            del confirmed_utxos[:tx_batch_size]
-
-    test_framework.log.debug("The tx should be evicted by now")
-    # The number of transactions created should be greater than the ones present in the mempool
-    assert_greater_than(tx_batch_size * num_of_batches, len(node.getrawmempool()))
-    # Initial tx created should not be present in the mempool anymore as it had a lower fee rate
-    assert tx_to_be_evicted_id not in node.getrawmempool()
-
-    test_framework.log.debug("Check that mempoolminfee is larger than minrelaytxfee")
-    assert_equal(node.getmempoolinfo()['minrelaytxfee'], Decimal('0.00001000'))
-    assert_greater_than(node.getmempoolinfo()['mempoolminfee'], Decimal('0.00001000'))
 
 # Transaction/Block functions
 #############################

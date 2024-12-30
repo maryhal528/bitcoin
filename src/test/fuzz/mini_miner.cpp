@@ -7,11 +7,13 @@
 #include <test/util/txmempool.h>
 #include <test/util/mining.h>
 
-#include <node/mini_miner.h>
 #include <node/miner.h>
+#include <node/mini_miner.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <txmempool.h>
+#include <util/check.h>
+#include <util/translation.h>
 
 #include <deque>
 #include <vector>
@@ -32,8 +34,11 @@ void initialize_miner()
 // Test that the MiniMiner can run with various outpoints and feerates.
 FUZZ_TARGET(mini_miner, .init = initialize_miner)
 {
+    SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
-    CTxMemPool pool{CTxMemPool::Options{}};
+    bilingual_str error;
+    CTxMemPool pool{CTxMemPool::Options{}, error};
+    Assert(error.empty());
     std::vector<COutPoint> outpoints;
     std::deque<COutPoint> available_coins = g_available_coins;
     LOCK2(::cs_main, pool.cs);
@@ -55,7 +60,7 @@ FUZZ_TARGET(mini_miner, .init = initialize_miner)
         TestMemPoolEntryHelper entry;
         const CAmount fee{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/100000)};
         assert(MoneyRange(fee));
-        pool.addUnchecked(entry.Fee(fee).FromTx(tx));
+        AddToMempool(pool, entry.Fee(fee).FromTx(tx));
 
         // All outputs are available to spend
         for (uint32_t n{0}; n < num_outputs; ++n) {
@@ -108,8 +113,11 @@ FUZZ_TARGET(mini_miner, .init = initialize_miner)
 // Test that MiniMiner and BlockAssembler build the same block given the same transactions and constraints.
 FUZZ_TARGET(mini_miner_selection, .init = initialize_miner)
 {
+    SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
-    CTxMemPool pool{CTxMemPool::Options{}};
+    bilingual_str error;
+    CTxMemPool pool{CTxMemPool::Options{}, error};
+    Assert(error.empty());
     // Make a copy to preserve determinism.
     std::deque<COutPoint> available_coins = g_available_coins;
     std::vector<CTransactionRef> transactions;
@@ -148,7 +156,7 @@ FUZZ_TARGET(mini_miner_selection, .init = initialize_miner)
         TestMemPoolEntryHelper entry;
         const CAmount fee{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/100000)};
         assert(MoneyRange(fee));
-        pool.addUnchecked(entry.Fee(fee).FromTx(tx));
+        AddToMempool(pool, entry.Fee(fee).FromTx(tx));
         transactions.push_back(tx);
     }
     std::vector<COutPoint> outpoints;
@@ -168,23 +176,23 @@ FUZZ_TARGET(mini_miner_selection, .init = initialize_miner)
     miner_options.blockMinFeeRate = target_feerate;
     miner_options.nBlockMaxWeight = DEFAULT_BLOCK_MAX_WEIGHT;
     miner_options.test_block_validity = false;
+    miner_options.coinbase_output_script = CScript() << OP_0;
 
     node::BlockAssembler miner{g_setup->m_node.chainman->ActiveChainstate(), &pool, miner_options};
     node::MiniMiner mini_miner{pool, outpoints};
     assert(mini_miner.IsReadyToCalculate());
 
-    CScript spk_placeholder = CScript() << OP_0;
     // Use BlockAssembler as oracle. BlockAssembler and MiniMiner should select the same
     // transactions, stopping once packages do not meet target_feerate.
-    const auto blocktemplate{miner.CreateNewBlock(spk_placeholder)};
+    const auto blocktemplate{miner.CreateNewBlock()};
     mini_miner.BuildMockTemplate(target_feerate);
     assert(!mini_miner.IsReadyToCalculate());
     auto mock_template_txids = mini_miner.GetMockTemplateTxids();
     // MiniMiner doesn't add a coinbase tx.
     assert(mock_template_txids.count(blocktemplate->block.vtx[0]->GetHash()) == 0);
-    mock_template_txids.emplace(blocktemplate->block.vtx[0]->GetHash());
-    assert(mock_template_txids.size() <= blocktemplate->block.vtx.size());
-    assert(mock_template_txids.size() >= blocktemplate->block.vtx.size());
+    auto [iter, new_entry] = mock_template_txids.emplace(blocktemplate->block.vtx[0]->GetHash());
+    assert(new_entry);
+
     assert(mock_template_txids.size() == blocktemplate->block.vtx.size());
     for (const auto& tx : blocktemplate->block.vtx) {
         assert(mock_template_txids.count(tx->GetHash()));
